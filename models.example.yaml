@@ -1,0 +1,42 @@
+modelscope:
+  baseUrl: "https://api-inference.modelscope.cn/v1"
+  apiKey: "${MODELSCOPE_API_KEY}"
+  models:
+    - "Qwen/Qwen3.5-397B-A17B"
+    - "ZhipuAI/GLM-5"
+  timeout: 30
+  weight: 10 # 权重较高，优先使用
+  enabled: true
+  quota_period: "daily" # 每日额度刷新
+
+openai:
+  baseUrl: "https://api.openai.com/v1"
+  apiKey: "${OPENAI_API_KEY}"
+  models:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+  timeout: 30
+  weight: 5 # 权重较低，作为备选
+  enabled: true
+  quota_period: "monthly" # 月度额度刷新
+
+azure:
+  baseUrl: "https://your-resource.openai.azure.com/openai/deployments"
+  apiKey: "${AZURE_API_KEY}"
+  models:
+    - "gpt-4"
+    - "gpt-35-turbo"
+  timeout: 45
+  weight: 8 # 权重中等
+  enabled: true
+  quota_period: "weekly" # 周度额度刷新
+
+local:
+  baseUrl: "http://localhost:11434/v1"
+  apiKey: "ollama"
+  models:
+    - "llama3"
+  timeout: 120
+  weight: 1 # 权重最低，最后使用
+  enabled: true
+  # 无quota_period配置，表示无额度限制，始终可用
