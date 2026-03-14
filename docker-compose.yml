@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  openai-proxy:
+    build: .
+    container_name: openai-proxy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models.yaml:/app/models.yaml:ro
+    restart: unless-stopped
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    driver: bridge
