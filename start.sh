@@ -27,4 +27,4 @@ fi
 
 echo "启动 OpenAI 代理服务..."
 cd "$APP_PATH"
-python "run.py"
+uvicorn run:app --host 0.0.0.0 --port 8000 --reload
