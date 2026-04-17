@@ -1,0 +1,1 @@
+# Test configuration for plugin testing settings: cache: enabled: true ttl: 60 backend: "memory" openrouter: baseUrl: "https://openrouter.ai/api/v1" apiKey: "${TEST_OPENROUTER_API_KEY}" plugin: code: "plugin.openrouter" args: category: "free" cache_timeout: 60 enabled: true models: [] timeout: 20 weight: 1

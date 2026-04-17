@@ -3,4 +3,10 @@ venv/
 .env
 .env.local
 .env.*.local
+.cline/
+.clinerules/
+.opencode/
+.lingma/
+.trae/
+openspec/
 __pycache__/
