@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Dict, List
+from typing import Dict, List, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -20,21 +20,135 @@ class OpenAIProxyService:
 
     def __init__(self, config_file: str = "models.yaml"):
         self.config_loader = ConfigLoader(config_file)
-        self.models = self.config_loader.load_config()
+        # 注意：models 将在异步初始化方法中加载
+        self.models = None
+        self.failover_manager = None
+
+    async def initialize(self):
+        """异步初始化服务
+
+        对于使用爬虫模式的插件（如 OpenRouter、NVIDIA）：
+        1. 先获取平台列表（不加载模型，避免调用插件）
+        2. 启动爬虫并等待完成
+        3. 爬虫完成后加载完整的配置（包含模型列表）
+
+        这样只会加载一次配置，避免重复。
+        """
+        # 第一步：仅加载平台列表（不加载模型，不会触发插件调用）
+        platforms = await self.config_loader.load_platforms_only()
+
+        # 第二步：启动所有插件的定时任务调度器（会等待首次爬虫完成）
+        await self._start_plugin_schedulers_for_platforms(platforms)
+
+        # 第三步：爬虫完成后，加载完整配置以获取最新的模型列表
+        logger.info("=" * 60)
+        logger.info("爬虫任务已完成，加载配置以获取最新模型列表")
+        logger.info("=" * 60)
+        self.models = await self.config_loader.load_config()
+
+        # 第四步：初始化故障转移管理器
         self.failover_manager = ModelFailoverManager(self.models)
+
+    async def _start_plugin_schedulers_for_platforms(self, platforms: Dict[str, Any]):
+        """
+        为指定平台启动插件调度器
+
+        Args:
+            platforms: 平台配置字典，键为平台名称，值为平台配置
+        """
+        try:
+            logger.info(f"开始启动插件调度器，平台列表: {list(platforms.keys())}")
+            # 遍历所有平台，查找并启动插件调度器
+            for platform_name, platform_config in platforms.items():
+                if not isinstance(platform_config, dict):
+                    logger.debug(f"平台 [{platform_name}] 配置不是字典，跳过")
+                    continue
+
+                logger.info(f"检查平台 [{platform_name}] 的插件...")
+                # 尝试从插件管理器获取插件实例
+                plugin = self.config_loader.plugin_manager.get_plugin(platform_name)
+                logger.info(f"平台 [{platform_name}] 获取到的插件: {plugin}")
+
+                if plugin and hasattr(plugin, 'start_scheduler'):
+                    logger.info(f"正在启动平台 [{platform_name}] 的插件调度器...")
+                    try:
+                        # 等待初始爬虫任务完成，确保使用最新的模型数据
+                        await plugin.start_scheduler(wait_for_initial=True)
+                        logger.info(f"✓ 平台 [{platform_name}] 的插件调度器已启动")
+                    except Exception as e:
+                        logger.error(f"✗ 启动平台 [{platform_name}] 的插件调度器失败: {e}", exc_info=True)
+                else:
+                    if not plugin:
+                        logger.warning(f"平台 [{platform_name}] 没有关联的插件实例")
+                    else:
+                        logger.warning(f"平台 [{platform_name}] 的插件没有 start_scheduler 方法")
+        except Exception as e:
+            logger.error(f"启动插件调度器时出错: {e}", exc_info=True)
+
+    async def _start_plugin_schedulers(self):
+        """启动所有插件的定时任务调度器"""
+        try:
+            # 遍历所有平台，查找并启动插件调度器
+            for platform_name, model_configs in self.models.items():
+                # 即使模型列表为空，也应该尝试启动插件调度器（让定时任务去填充模型）
+
+                # 获取该平台的第一个模型配置（所有模型共享同一个插件）
+                first_model = model_configs[0] if model_configs else None
+
+                # 尝试从插件管理器获取插件实例
+                plugin = self.config_loader.plugin_manager.get_plugin(platform_name)
+                if plugin and hasattr(plugin, 'start_scheduler'):
+                    logger.info(f"正在启动平台 [{platform_name}] 的插件调度器...")
+                    try:
+                        # 等待初始爬虫任务完成，确保使用最新的模型数据
+                        await plugin.start_scheduler(wait_for_initial=True)
+                        logger.info(f"✓ 平台 [{platform_name}] 的插件调度器已启动")
+                    except Exception as e:
+                        logger.error(f"✗ 启动平台 [{platform_name}] 的插件调度器失败: {e}")
+                else:
+                    if not plugin:
+                        logger.debug(f"平台 [{platform_name}] 没有关联的插件")
+        except Exception as e:
+            logger.error(f"启动插件调度器时出错: {e}")
 
     async def close(self):
         """关闭服务"""
+        # 停止所有插件的定时任务调度器
+        await self._stop_plugin_schedulers()
         await self.failover_manager.close()
+
+    async def _stop_plugin_schedulers(self):
+        """停止所有插件的定时任务调度器"""
+        try:
+            for platform_name, model_configs in self.models.items():
+                if not model_configs:
+                    continue
+
+                plugin = self.config_loader.plugin_manager.get_plugin(platform_name)
+                if plugin and hasattr(plugin, 'stop_scheduler'):
+                    logger.info(f"正在停止平台 [{platform_name}] 的插件调度器...")
+                    try:
+                        await plugin.stop_scheduler()
+                        logger.info(f"✓ 平台 [{platform_name}] 的插件调度器已停止")
+                    except Exception as e:
+                        logger.error(f"✗ 停止平台 [{platform_name}] 的插件调度器失败: {e}")
+        except Exception as e:
+            logger.error(f"停止插件调度器时出错: {e}")
 
     def create_app(self) -> FastAPI:
         """创建FastAPI应用"""
-        
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             """应用生命周期管理器"""
             # 启动事件
             logger.info("OpenAI代理服务启动中...")
+            logger.info(f"正在加载配置文件: {self.config_loader.config_file}")
+
+            # 初始化服务（加载配置和插件）
+            await self.initialize()
+
+            logger.info("OpenAI代理服务启动完成")
             yield
             # 关闭事件
             await self.close()

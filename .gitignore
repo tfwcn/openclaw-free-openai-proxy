@@ -10,3 +10,4 @@ venv/
 .trae/
 openspec/
 __pycache__/
+data/

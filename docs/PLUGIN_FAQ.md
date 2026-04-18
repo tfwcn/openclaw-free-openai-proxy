@@ -12,11 +12,11 @@ openrouter:
   apiKey: "${OPENROUTER_API_KEY}"
   plugin:
     code: "plugin.openrouter"
-    cache_timeout: 300  # 缓存时间(秒)
+    cache_timeout: 300 # 缓存时间(秒)
     args:
       model_list_method: "GET"
       request_params:
-        max_price: 0  # 只获取免费模型
+        max_price: 0 # 只获取免费模型
 ```
 
 ### Q2: `cache_timeout` 应该放在哪里?
@@ -85,7 +85,7 @@ plugin:
   args:
     model_list_method: "GET"
     request_params:
-      max_price: 0  # 只获取免费模型
+      max_price: 0 # 只获取免费模型
 ```
 
 ### Q6: 可以按类别过滤模型吗?
@@ -95,7 +95,7 @@ plugin:
 ```yaml
 args:
   request_params:
-    categories: "programming"  # 编程类模型
+    categories: "programming" # 编程类模型
 ```
 
 支持的类别包括: `programming`, `storytelling`, `roleplay` 等。
@@ -137,7 +137,7 @@ nvidia:
     args:
       model_list_method: "GET"
       request_params:
-        nim_type: "anim_type_preview"  # 获取预览版(免费)模型
+        nim_type: "anim_type_preview" # 获取预览版(免费)模型
 ```
 
 ### Q9: 为什么我的 NVIDIA 模型列表是空的?
@@ -176,7 +176,7 @@ modelscope:
     args:
       model_list_method: "GET"
       request_params:
-        SupportInference: "txt2txt"  # 文本生成模型
+        SupportInference: "txt2txt" # 文本生成模型
 ```
 
 支持的推理类型: `txt2txt`(文本生成), `txt2img`(文生图) 等。
@@ -192,9 +192,8 @@ modelscope:
 ```yaml
 plugin:
   code: "plugin.openrouter"
-  cache_timeout: 0  # 禁用缓存,每次都从 API 获取
-  args:
-    ...
+  cache_timeout: 0 # 禁用缓存,每次都从 API 获取
+  args: ...
 ```
 
 ### Q12: 不同平台的缓存会相互影响吗?
@@ -209,7 +208,7 @@ openrouter_free:
     cache_timeout: 300
     args:
       request_params:
-        max_price: 0  # 免费模型
+        max_price: 0 # 免费模型
 
 openrouter_paid:
   plugin:
@@ -217,7 +216,7 @@ openrouter_paid:
     cache_timeout: 300
     args:
       request_params:
-        max_price: 0.01  # 付费模型
+        max_price: 0.01 # 付费模型
 ```
 
 ### Q13: 缓存什么时候会被清除?
@@ -239,7 +238,7 @@ openrouter_paid:
 ```yaml
 openrouter:
   baseUrl: "https://openrouter.ai/api/v1"
-  apiKey: "${OPENROUTER_API_KEY}"  # 从环境变量读取
+  apiKey: "${OPENROUTER_API_KEY}" # 从环境变量读取
 ```
 
 在 `.env` 文件中定义:
@@ -254,7 +253,7 @@ OPENROUTER_API_KEY=sk-or-your-api-key
 
 ```yaml
 # 如果 OPENROUTER_API_KEY 未定义
-apiKey: "${OPENROUTER_API_KEY}"  # ← 保持原样,不会替换
+apiKey: "${OPENROUTER_API_KEY}" # ← 保持原样,不会替换
 ```
 
 建议在启动前检查所有必需的环境变量是否已设置。
@@ -337,6 +336,127 @@ plugin:
 ```
 
 详见 [MIGRATION_GUIDE.md](./MIGRATION_GUIDE.md)。
+
+---
+
+## NVIDIA 爬虫功能
+
+### Q15: NVIDIA 插件如何获取免费模型列表?
+
+**A:** NVIDIA 插件使用 Playwright 网页爬虫从 build.nvidia.com 自动抓取免费预览模型。爬虫始终启用，无需额外配置：
+
+```yaml
+nvidia:
+  baseUrl: "https://integrate.api.nvidia.com/v1"
+  apiKey: "${NVIDIA_API_KEY}"
+  plugin:
+    code: "plugin.nvidia"
+    cache_timeout: 3600
+    args:
+      free_model_count: 10 # 获取前10个免费模型
+      cache_file: "data/nvidia_free_models.json"
+      enable_scheduled_task: true # 启用定时更新
+      schedule_cron: "0 2 * * *" # 每天凌晨2点
+```
+
+### Q16: 爬虫多久更新一次模型列表?
+
+**A:** 默认策略：
+
+- **服务启动时**：立即执行一次抓取
+- **定时任务**：每天凌晨 2:00 自动更新
+- **手动触发**：重启服务也会触发更新
+
+可以通过 `schedule_cron` 自定义更新时间，例如：
+
+- `"0 3 * * *"` - 每天凌晨3点
+- `"0 */6 * * *"` - 每6小时
+- `"0 0 * * 0"` - 每周日凌晨
+
+### Q17: 如果爬虫失败会怎么办?
+
+**A:** 系统采用三层降级策略：
+
+1. **优先使用缓存**：如果之前成功抓取过，使用缓存数据
+2. **回退到API**：如果缓存不存在，调用API获取所有模型并智能过滤
+3. **返回空列表**：如果都失败，返回空列表并记录错误
+
+错误信息会记录在日志和缓存文件的 `error_log` 字段中。
+
+### Q18: 如何查看爬虫运行状态?
+
+**A:** 有两种方式：
+
+1. **查看日志**：
+
+   ```bash
+   # 查看爬虫相关日志
+   grep -i "scraper\|crawler\|nvidia" logs/app.log
+   ```
+
+2. **健康检查端点**（如果已实现）：
+   ```bash
+   curl http://localhost:8000/health | jq '.plugins.nvidia.scraper'
+   ```
+
+### Q19: 缓存文件在哪里？可以手动编辑吗?
+
+**A:**
+
+- **默认位置**：`data/nvidia_free_models.json`
+- **文件格式**：JSON，人类可读
+- **可以编辑**：是的，但建议通过配置修改参数而非手动编辑
+
+缓存文件结构：
+
+```json
+{
+  "models": [
+    {
+      "model_id": "deepseek-ai/deepseek-v3.2",
+      "model_name": "...",
+      "rank": 1
+    }
+  ],
+  "metadata": {
+    "fetch_time": 1234567890,
+    "total_count": 10
+  },
+  "last_success": "2026-04-18T02:00:00+00:00",
+  "error_log": []
+}
+```
+
+### Q20: 为什么获取的免费模型数量不对?
+
+**A:** 可能的原因：
+
+1. **配置问题**：检查 `free_model_count` 参数（默认10，范围1-100）
+2. **API限制**：NVIDIA API可能临时不可用
+3. **过滤规则**：内置的免费模型识别规则可能需要更新
+4. **缓存过期**：删除缓存文件后重新抓取
+
+调试步骤：
+
+```bash
+# 1. 删除缓存
+rm data/nvidia_free_models.json
+
+# 2. 重启服务
+python run.py
+
+# 3. 查看日志
+grep "NVIDIA" logs/app.log | tail -50
+```
+
+### Q21: 爬虫会影响服务性能吗?
+
+**A:** 不会，因为：
+
+- **异步执行**：爬虫在后台运行，不阻塞主服务
+- **缓存优先**：大部分时间直接从缓存读取，速度极快
+- **超时控制**：默认60秒超时，防止长时间等待
+- **资源管理**：浏览器实例用完即关闭
 
 ---
 

@@ -1,9 +1,22 @@
+# ModelScope 免费模型配置示例
+# 使用网页爬虫从 modelscope.cn 获取热门免费模型列表
 modelscope:
   baseUrl: "https://api-inference.modelscope.cn/v1"
   apiKey: "${MODELSCOPE_API_KEY}"
-  models:
-    - "Qwen/Qwen3.5-397B-A17B"
-    - "ZhipuAI/GLM-5"
+  plugin:
+    code: "plugin.modelscope"
+    cache_timeout: 3600 # 缓存过期时间（秒），默认1小时
+    args:
+      # 爬虫配置（必填）
+      scrape_url: "https://www.modelscope.cn/models?filter=inference_type&page=1&sort=default&tabKey=task" # 爬虫URL（必填）
+      max_models: 50 # 获取的最大模型数量
+      scraper_timeout: 60 # 爬虫超时时间（秒）
+      headless: true # 无头模式运行浏览器
+
+      # 定时任务配置
+      enable_scheduled_task: true # 是否启用定时任务
+      schedule_cron: "0 2 * * *" # cron表达式，每天凌晨2点执行
+  models: [] # 静态配置的模型（可选，会追加到爬虫获取的模型后面）
   timeout: 30
   weight: 10 # 权重较高，优先使用
   enabled: true
@@ -20,20 +33,53 @@ modelscope:
 #   enabled: true
 #   quota_period: "monthly" # 月度额度刷新
 
+# OpenRouter 免费模型配置示例
+# 使用网页爬虫从 openrouter.ai 获取免费模型列表
 openrouter:
   baseUrl: "https://openrouter.ai/api/v1"
   apiKey: "${OPENROUTER_API_KEY}"
   plugin:
     code: "plugin.openrouter"
-    args: # 参数可选
-      category: "free"
-      input_modalities: ["text"]
-      output_modalities: ["text"]
-      cache_timeout: 300 # 缓存过期时间（秒），默认300秒（5分钟）
-  models: # 静态配置的模型会放在插件返回的模型后面
+    cache_timeout: 300 # 缓存过期时间（秒），默认5分钟
+    args:
+      # 爬虫配置（必填）
+      scrape_url: "https://openrouter.ai/models?fmt=cards&input_modalities=text&max_price=0&order=most-popular&output_modalities=text" # 爬虫URL（必填）
+      max_models: 50 # 获取的最大模型数量
+      scraper_timeout: 60 # 爬虫超时时间（秒）
+      headless: true # 无头模式运行浏览器
+
+      # 定时任务配置
+      enable_scheduled_task: true # 是否启用定时任务
+      schedule_cron: "0 2 * * *" # cron表达式，每天凌晨2点执行
+  models:
+    # 静态配置的模型会放在插件返回的模型后面（可选）
     - openrouter/free
   timeout: 10
   weight: 1
+  enabled: true
+
+# NVIDIA NIM 免费模型配置示例
+# 使用网页爬虫从 build.nvidia.com 获取免费预览模型列表
+nvidia:
+  baseUrl: "https://integrate.api.nvidia.com/v1"
+  apiKey: "${NVIDIA_API_KEY}"
+  plugin:
+    code: "plugin.nvidia"
+    cache_timeout: 3600 # 缓存过期时间（秒），默认1小时
+    args:
+      # 爬虫配置（必填）
+      scrape_url: "https://build.nvidia.com/models?filters=nimType%3Anim_type_preview&orderBy=weightPopular%3ADESC" # 爬虫URL（必填）
+      free_model_count: 10 # 获取的免费模型数量
+      cache_file: "data/nvidia_free_models.json" # 缓存文件路径
+      scraper_timeout: 60 # 爬虫超时时间（秒）
+      headless: true # 无头模式运行浏览器
+
+      # 定时任务配置
+      enable_scheduled_task: true # 是否启用定时任务
+      schedule_cron: "0 2 * * *" # cron表达式，每天凌晨2点执行
+  models: [] # 静态配置的模型（可选，会追加到爬虫获取的模型后面）
+  timeout: 30
+  weight: 5
   enabled: true
 
 # azure:

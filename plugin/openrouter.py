@@ -4,11 +4,13 @@ import logging
 import os
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-import json
 import time
 
 from openai_proxy.core.error_classifier import ErrorClassifier, ErrorType
 from openai_proxy.core.base_plugin import BasePlugin
+from openai_proxy.core.openrouter_scraper import OpenRouterModelScraper
+from openai_proxy.core.model_cache import ModelCacheManager
+from openai_proxy.core.scheduled_scraper import ScheduledScraper
 
 logger = logging.getLogger(__name__)
 
@@ -30,25 +32,46 @@ class OpenRouterPlugin(BasePlugin):
     """OpenRouter 平台插件"""
 
     def __init__(
-        self, 
-        api_key: Optional[str] = None, 
+        self,
+        api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         cache_ttl: int = 300,
+        scrape_url: Optional[str] = None,
+        max_models: int = 50,
+        scraper_timeout: int = 60,
+        headless: bool = True,
+        plugin_config: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
         """
         初始化 OpenRouter 插件
-        
+
         Args:
             api_key: API 密钥，如果为 None 则从环境变量获取
             base_url: API 基础URL，如果为 None 则使用默认值
             cache_ttl: 缓存有效期（秒），默认300秒（5分钟）
+            scrape_url: 爬虫URL，用于从网页抓取免费模型
+            max_models: 最大模型数量，默认50
+            scraper_timeout: 爬虫超时时间（秒），默认60秒
+            headless: 是否使用无头模式运行浏览器，默认True
+            plugin_config: 完整的插件配置字典（可选）
             **kwargs: 其他插件特定参数
         """
         # 设置默认值
         if base_url is None:
             base_url = "https://openrouter.ai/api"
-            
+
+        # 如果提供了 plugin_config，从中提取参数
+        if plugin_config:
+            args = plugin_config.get('args', {})
+            scrape_url = scrape_url or args.get('scrape_url')
+            # 只有当参数为默认值时才从 config 中获取
+            if max_models == 50 and 'max_models' in args:
+                max_models = args['max_models']
+            if scraper_timeout == 60 and 'scraper_timeout' in args:
+                scraper_timeout = args['scraper_timeout']
+            headless = args.get('headless', headless)
+
         # 调用父类初始化
         super().__init__(
             api_key=api_key or os.getenv("OPENROUTER_API_KEY"),
@@ -56,9 +79,34 @@ class OpenRouterPlugin(BasePlugin):
             cache_ttl=cache_ttl,
             **kwargs
         )
-        
-        if not self.api_key:
-            logger.warning("OpenRouter API 密钥未配置，插件将无法工作")
+
+        # 爬虫配置
+        self.scrape_url = scrape_url
+        self.max_models = max_models
+        self.scraper_timeout = scraper_timeout
+        self.headless = headless
+
+        # 定时任务配置
+        self.cache_file = kwargs.get('cache_file', 'data/openrouter_free_models.json')
+        self.schedule_cron = kwargs.get('schedule_cron', '0 2 * * *')
+        self.enable_scheduled_task = kwargs.get('enable_scheduled_task', True)
+
+        if not self.api_key and not self.scrape_url:
+            logger.warning("OpenRouter API 密钥和爬虫URL都未配置，插件将无法工作")
+
+        # 初始化缓存管理器
+        self.cache_manager = ModelCacheManager(cache_file=self.cache_file)
+
+        # 初始化爬虫和调度器
+        self.scraper: Optional[OpenRouterModelScraper] = None
+        self.scheduler: Optional[ScheduledScraper] = None
+
+        # 标记是否已完成首次爬虫任务
+        self.initial_scrape_completed: bool = False
+
+        self._init_scraper()
+        if self.enable_scheduled_task:
+            self._init_scheduler()
 
     async def health_check(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -70,24 +118,18 @@ class OpenRouterPlugin(BasePlugin):
         Returns:
             健康检查结果
         """
-        if not self.api_key:
+        if not self.scrape_url:
             return {
                 "status": "unhealthy",
-                "error": "API 密钥未配置",
+                "error": "爬虫URL未配置",
                 "response_time_ms": 0
             }
 
+        # 简单检查爬虫URL是否可访问
         start_time = time.time()
         try:
             async with aiohttp.ClientSession() as session:
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "User-Agent": "openai-proxy-plugin/1.0"
-                }
-
-                # 简单的健康检查 - 尝试获取模型列表
-                url = f"{self.base_url}/models"
-                async with session.get(url, headers=headers, timeout=10) as response:
+                async with session.get(self.scrape_url, timeout=10) as response:
                     response_time = (time.time() - start_time) * 1000
 
                     if response.status == 200:
@@ -96,17 +138,10 @@ class OpenRouterPlugin(BasePlugin):
                             "response_time_ms": int(response_time),
                             "last_check": time.time()
                         }
-                    elif response.status == 401:
-                        return {
-                            "status": "unhealthy",
-                            "error": "API 密钥无效",
-                            "response_time_ms": int(response_time)
-                        }
                     else:
-                        error_text = await response.text()
                         return {
                             "status": "unhealthy",
-                            "error": f"HTTP {response.status}: {error_text}",
+                            "error": f"HTTP {response.status}",
                             "response_time_ms": int(response_time)
                         }
 
@@ -123,157 +158,206 @@ class OpenRouterPlugin(BasePlugin):
                 "response_time_ms": int((time.time() - start_time) * 1000)
             }
 
+    def _init_scraper(self) -> None:
+        """初始化OpenRouter模型爬虫"""
+        try:
+            if not self.scrape_url:
+                logger.warning("scrape_url 未配置，爬虫功能将不可用")
+                return
+
+            logger.info(f"✓ 使用配置的爬虫URL: {self.scrape_url}")
+
+            self.scraper = OpenRouterModelScraper(
+                scrape_url=self.scrape_url,
+                max_models=self.max_models,
+                timeout=self.scraper_timeout,
+                headless=self.headless
+            )
+            logger.info(f"✓ OpenRouter网页爬虫已初始化 (max_models={self.max_models})")
+        except Exception as e:
+            logger.error(f"初始化爬虫失败: {e}")
+            raise
+
+    def _init_scheduler(self) -> None:
+        """初始化定时任务调度器"""
+        try:
+            async def scrape_task():
+                """包装爬虫任务"""
+                await self._run_scraper_and_cache()
+
+            self.scheduler = ScheduledScraper(
+                scrape_func=scrape_task,
+                cron_expression=self.schedule_cron,
+                run_on_start=True,
+                timezone="Asia/Shanghai"
+            )
+            logger.info(f"✓ 定时调度器已初始化 (cron='{self.schedule_cron}')")
+        except Exception as e:
+            logger.error(f"初始化调度器失败: {e}")
+
+    async def _run_scraper_and_cache(self) -> None:
+        """执行爬虫并缓存结果"""
+        if not self.scraper:
+            logger.warning("爬虫未初始化")
+            return
+
+        try:
+            logger.info("开始执行爬虫任务...")
+            models_data = await self.scraper.scrape()
+
+            if models_data:
+                # 转换为 OpenRouterModel 对象
+                models = [
+                    OpenRouterModel(
+                        model_id=m['model_id'],
+                        model_name=m.get('model_name', m['model_id']),
+                        capabilities=["text"]
+                    )
+                    for m in models_data
+                ]
+
+                # 保存至缓存
+                metadata = {
+                    "fetch_time": time.time(),
+                    "total_count": len(models),
+                    "returned_count": len(models),
+                    "source": "web_scraper"
+                }
+
+                success = self.cache_manager.save(
+                    models=[m.__dict__ for m in models],
+                    metadata=metadata,
+                    success=True
+                )
+
+                if success:
+                    logger.info(f"✓ 爬虫任务完成，缓存 {len(models)} 个模型")
+                    # 更新内存缓存
+                    self.update_cache(models)
+                    # 标记首次爬虫已完成
+                    if not self.initial_scrape_completed:
+                        self.initial_scrape_completed = True
+                        logger.info("✓ 首次爬虫任务完成，后续将使用最新数据")
+                else:
+                    logger.error("✗ 保存缓存失败")
+            else:
+                logger.warning("爬虫返回空结果")
+
+        except Exception as e:
+            error_msg = f"爬虫任务异常: {type(e).__name__}: {e}"
+            logger.error(error_msg, exc_info=True)
+
+            # 记录错误
+            self.cache_manager.save(
+                models=[],
+                metadata={"error": error_msg},
+                success=False
+            )
+            raise
+
     async def get_models(self, plugin_config: Dict[str, Any] = None) -> List[OpenRouterModel]:
         """
-        获取模型列表
-        
+        获取模型列表（仅通过爬虫方式）
+
         Args:
             plugin_config: 插件配置
-            
+
         Returns:
             模型列表
         """
         plugin_config = plugin_config or {}
-        
+
         # 验证配置
         warnings = self._validate_request_config(plugin_config)
         for warning in warnings:
             logger.warning(f"OpenRouter 配置警告: {warning}")
-        
-        # 检查缓存
-        if self.is_cache_valid():
-            logger.debug(f"使用缓存的 OpenRouter 模型列表，共 {len(self.models_cache)} 个模型")
-            return self.models_cache
-        
-        if not self.api_key:
-            logger.warning("OpenRouter API 密钥未配置，返回空模型列表")
+
+        # 检查是否已完成首次爬虫
+        if not self.initial_scrape_completed:
+            logger.warning("首次爬虫任务尚未完成，返回空模型列表。这不应该发生，请检查启动日志。")
             return []
 
-        start_time = time.time()
-        try:
-            # 构建请求配置
-            request_config = self._build_model_list_request(plugin_config)
-            
-            # 发起请求
-            response_data = await self._make_api_request(
-                url=request_config['url'],
-                method=request_config['method'],
-                headers=request_config['headers'],
-                params=request_config['params'],
-                json_data=request_config['json_data'],
-                timeout=30
-            )
-            
-            # 解析响应（私有方法）
-            models = self._parse_response(response_data)
-            
-            # 更新缓存
-            self.update_cache(models)
-            
-            fetch_time = (time.time() - start_time) * 1000
-            logger.info(
-                f"从 OpenRouter API 获取到 {len(models)} 个模型，"
-                f"耗时: {fetch_time:.2f}ms"
-            )
-            
-            return models
+        # 从内存缓存获取模型（爬虫完成后已更新到内存）
+        if self.models_cache and self.is_cache_valid():
+            logger.debug(f"从内存缓存返回 {len(self.models_cache)} 个模型")
+            return self.models_cache
 
-        except Exception as e:
-            logger.error(f"获取 OpenRouter 模型列表失败: {e}")
-            # 如果 API 调用失败但有缓存，返回缓存数据
-            if self.models_cache:
-                logger.warning("使用缓存的模型列表")
-                return self.models_cache
-            raise
+        # 如果内存缓存不可用，尝试从文件缓存加载（作为降级方案）
+        if self.cache_manager.is_valid():
+            try:
+                cache_data = self.cache_manager.load()
+                if cache_data and cache_data.get('models'):
+                    cached_models = cache_data['models']
+                    logger.info(f"✓ 从文件缓存加载 {len(cached_models)} 个免费模型（降级方案）")
 
-    def _parse_response(self, data: Dict[str, Any]) -> List[OpenRouterModel]:
+                    # 转换为 OpenRouterModel 对象
+                    models = [
+                        OpenRouterModel(
+                            model_id=m['model_id'],
+                            model_name=m.get('model_name', m['model_id']),
+                            capabilities=["text"]
+                        )
+                        for m in cached_models
+                    ]
+
+                    # 更新内部缓存
+                    self.update_cache(models)
+                    return models
+            except Exception as e:
+                logger.warning(f"从文件缓存加载失败: {e}")
+
+        # 最后的降级方案：返回空列表
+        logger.warning("无法获取模型列表，返回空列表")
+        return []
+
+    async def _get_models_from_scraper(self) -> List[OpenRouterModel]:
         """
-        解析 OpenRouter 特有的响应格式
-        
-        Args:
-            data: API 响应数据
-            
+        使用爬虫从网页获取免费模型列表
+
         Returns:
             模型列表
         """
-        models = []
-        
+        logger.info(f"使用爬虫从 {self.scrape_url} 获取免费模型...")
+
         try:
-            # 处理不同格式的响应
-            if isinstance(data, dict):
-                # OpenRouter API 返回嵌套结构: {"data": {"models": [...], ...}}
-                if 'data' in data and isinstance(data['data'], dict) and 'models' in data['data']:
-                    model_list = data['data']['models']
-                elif 'models' in data and isinstance(data['models'], list):
-                    model_list = data['models']
-                elif 'data' in data and isinstance(data['data'], list):
-                    model_list = data['data']
-                else:
-                    model_list = []
-            elif isinstance(data, list):
-                model_list = data
-            else:
-                logger.error(f"API 返回的数据格式不支持，实际类型: {type(data)}")
-                model_list = []
-            
-            # 解析每个模型
-            for model_card in model_list:
-                if isinstance(model_card, dict):
-                    model_info = self._parse_model_info(model_card)
-                    if model_info:
-                        models.append(model_info)
-            
-            logger.debug(f"成功解析 {len(models)} 个有效模型")
-            
-        except Exception as e:
-            logger.error(f"解析 OpenRouter 响应时出错: {e}")
-        
-        return models
-
-    def _parse_model_info(self, model_info: Dict[str, Any]) -> Optional[OpenRouterModel]:
-        """
-        解析模型信息
-
-        Args:
-            model_info: 原始模型信息
-
-        Returns:
-            解析后的模型对象
-        """
-        try:
-            model_id = model_info.get("slug")
-            if not model_id:
-                return None
-
-            # 添加 :free 后缀，与旧版本保持一致，确保模型ID格式正确
-            model_id_with_suffix = f"{model_id}:free"
-
-            model_name = model_info.get("name") or model_id
-
-            # 提取上下文窗口信息
-            context_window = None
-            if "context_length" in model_info:
-                context_window = model_info["context_length"]
-            elif "max_tokens" in model_info:
-                context_window = model_info["max_tokens"]
-
-            # 提取功能信息
-            capabilities = ["text"]
-            if "capabilities" in model_info:
-                caps = model_info["capabilities"]
-                if isinstance(caps, list):
-                    capabilities = caps
-
-            return OpenRouterModel(
-                model_id=model_id_with_suffix,
-                model_name=model_name,
-                context_window=context_window,
-                capabilities=capabilities
+            # 创建爬虫实例
+            scraper = OpenRouterModelScraper(
+                scrape_url=self.scrape_url,
+                max_models=self.max_models,
+                timeout=self.scraper_timeout,
+                headless=self.headless
             )
 
+            # 执行爬虫
+            models_data = await scraper.scrape()
+
+            if not models_data:
+                logger.warning("爬虫未获取到模型数据")
+                return []
+
+            # 转换为 OpenRouterModel 对象
+            models = []
+            for model_data in models_data:
+                model_id = model_data.get('model_id')
+                model_name = model_data.get('model_name', model_id)
+
+                # 添加 :free 后缀
+                if model_id and not model_id.endswith(':free'):
+                    model_id = f"{model_id}:free"
+
+                if model_id:
+                    models.append(OpenRouterModel(
+                        model_id=model_id,
+                        model_name=model_name,
+                        capabilities=["text"]
+                    ))
+
+            logger.info(f"✓ 从爬虫获取到 {len(models)} 个免费模型")
+            return models
+
         except Exception as e:
-            logger.debug(f"解析模型信息失败: {e}")
-            return None
+            logger.error(f"爬虫执行失败: {e}", exc_info=True)
+            raise
 
     async def parse_error(self, response_data: Any) -> ErrorType:
         """
@@ -308,12 +392,12 @@ class OpenRouterPlugin(BasePlugin):
     def _get_cache_key(self, category: Optional[str], input_modalities: Optional[str], output_modalities: Optional[str]) -> str:
         """
         生成缓存键
-        
+
         Args:
             category: 模型类别
             input_modalities: 输入模态
             output_modalities: 输出模态
-            
+
         Returns:
             缓存键字符串
         """
@@ -321,3 +405,35 @@ class OpenRouterPlugin(BasePlugin):
         input_str = input_modalities if input_modalities is not None else "all"
         output_str = output_modalities if output_modalities is not None else "all"
         return f"openrouter:{category_str}:{input_str}:{output_str}"
+
+    async def start_scheduler(self, wait_for_initial: bool = True) -> None:
+        """
+        启动定时任务调度器
+
+        Args:
+            wait_for_initial: 是否等待初始爬虫任务完成，默认True
+                             这样可以确保服务启动时使用最新的模型数据
+
+        应在服务启动时调用此方法。
+        """
+        if self.scheduler:
+            try:
+                await self.scheduler.start(wait_for_initial=wait_for_initial)
+                logger.info("✓ OpenRouter爬虫调度器已启动")
+            except Exception as e:
+                logger.error(f"启动调度器失败: {e}")
+        else:
+            logger.debug("调度器未初始化（可能未启用爬虫功能）")
+
+    async def stop_scheduler(self) -> None:
+        """
+        停止定时任务调度器
+
+        应在服务关闭时调用此方法。
+        """
+        if self.scheduler:
+            try:
+                await self.scheduler.stop(wait=True, timeout=5)
+                logger.info("✓ OpenRouter爬虫调度器已停止")
+            except Exception as e:
+                logger.error(f"停止调度器失败: {e}")

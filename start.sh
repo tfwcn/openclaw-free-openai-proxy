@@ -14,17 +14,16 @@ if [ ! -d "$VENV_PATH" ]; then
     echo "虚拟环境创建完成"
     
     echo "激活虚拟环境并安装依赖..."
-    source "$VENV_PATH/bin/activate"
-    pip install --upgrade pip
-    pip install -r "$APP_PATH/requirements.txt"
-    echo "依赖安装完成"
 else
     echo "虚拟环境已存在，跳过创建步骤"
-    source "$VENV_PATH/bin/activate"
-    pip install --upgrade pip
-    pip install -r "$APP_PATH/requirements.txt"
 fi
+source "$VENV_PATH/bin/activate"
+pip install --upgrade pip
+pip install -r "$APP_PATH/requirements.txt"
+python3 -m playwright install --dry-run chromium
+echo "依赖安装完成"
 
 echo "启动 OpenAI 代理服务..."
 cd "$APP_PATH"
-uvicorn run:app --host 0.0.0.0 --port 8000 --reload
+# uvicorn run:app --host 0.0.0.0 --port 8000 --reload
+uvicorn run:app --host 0.0.0.0 --port 8000
